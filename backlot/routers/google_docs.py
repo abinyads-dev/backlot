@@ -345,6 +345,8 @@ for _key, _group in {
     ("docs.InsertTextRequest", "location"): "insertion_location",
     ("docs.InsertTextRequest", "endOfSegmentLocation"): "insertion_location",
     ("docs.InsertPageBreakRequest", "location"): "insertion_location",
+    ("docs.InsertTableRequest", "location"): "insertion_location",
+    ("docs.InsertTableRequest", "endOfSegmentLocation"): "insertion_location",
     ("docs.InsertPageBreakRequest", "endOfSegmentLocation"): "insertion_location",
     ("docs.CreateFootnoteRequest", "location"): "footnote_reference_location",
     ("docs.CreateFootnoteRequest", "endOfSegmentLocation"): "footnote_reference_location",
@@ -495,6 +497,20 @@ def _docs_past_end(index: int, body: gdocs.Body) -> None:
         )
 
 
+# What an insert at the first section break or at a table's index is refused with, and what
+# `insertText` adds to it: measured 2026-10-29 and 2026-11-03.
+_DOCS_OUTSIDE = "The insertion index must be inside the bounds of an existing paragraph."
+_DOCS_NEWLINES = " You can still create new paragraphs by inserting newlines."
+
+
+def _docs_in_paragraph(body: gdocs.Body, index: int, message: str) -> None:
+    """Refuse an index at a body's section break or at a table's start, row, cell or end
+    (`gdocs.TABLE`): measured 2026-11-03, an insert at each was refused as one at 0."""
+    pos = body.position(index)
+    if index < body.base or pos is not None and not body.in_paragraph(pos):
+        raise _EditorRefused(message)
+
+
 def _docs_cluster(body: gdocs.Body, index: int) -> int:
     pos = body.position(index)
     if pos is None or body.splits_cluster(pos):
@@ -522,11 +538,7 @@ def _docs_insert_text(doc: gdocs.Document, req: dict) -> tuple[dict, bool]:
     _, body = _docs_segment(doc, tab, where)
     if "location" in req:
         _docs_past_end(index, body)
-        if index < body.base:
-            raise _EditorRefused(
-                "The insertion index must be inside the bounds of an existing paragraph. You can "
-                "still create new paragraphs by inserting newlines."
-            )
+        _docs_in_paragraph(body, index, _DOCS_OUTSIDE + _DOCS_NEWLINES)
         pos = _docs_cluster(body, index)
     else:
         pos = len(body.chars) - 1
@@ -563,7 +575,7 @@ _DOCS_NO_INDEX = "Invalid range: must contain a start and end index"
 def _docs_delete_content_range(doc: gdocs.Document, req: dict) -> tuple[dict, bool]:
     """``deleteContentRange``, in real's order of refusals, measured: the range (`_docs_range`), an
     empty range, a body's section break at 0, the segment's last newline, and either end inside a
-    surrogate pair.
+    surrogate pair or the range taking part of a table (`gdocs.Body.cuts_table`).
     Deleting a combining mark without the letter it sits on is taken, and deleting a footnote
     reference deletes its footnote."""
     _, _, body, start, end = _docs_range(
@@ -578,7 +590,7 @@ def _docs_delete_content_range(doc: gdocs.Document, req: dict) -> tuple[dict, bo
             "The range cannot include the newline character at the end of the segment."
         )
     first, last = body.position(start), body.position(end)
-    if first is None or last is None:
+    if first is None or last is None or body.cuts_table(first, last):
         raise _EditorRefused("Invalid deletion range. Cannot delete the requested range.")
     body.delete(first, last)
     return {}, False
@@ -627,7 +639,9 @@ def _docs_insert_element(doc: gdocs.Document, req: dict, what: str) -> tuple[dic
     """Where a footnote reference or a page break goes, in real's order of refusals, measured
     2026-11-02: no location, the tab, an index below zero, the segment, the index at or past the
     segment's end, a header, footer or footnote, then 0 and inside a grapheme cluster.
-    `endOfSegmentLocation` is before the body's last newline."""
+    `endOfSegmentLocation` is before the body's last newline. Measured 2026-11-03, a page break
+    anywhere in a table is refused before the index is, its end included and its start not, and a
+    reference at a table's start, row, cell or end is refused as one at 0."""
     where = req.get("location", req.get("end_of_segment_location"))
     if where is None:
         raise _EditorRefused(
@@ -646,10 +660,10 @@ def _docs_insert_element(doc: gdocs.Document, req: dict, what: str) -> tuple[dic
         raise _EditorRefused(f"Cannot insert page break in a {kind}.")
     if "location" not in req:
         return tab, body, len(body.chars) - 1
-    if index == 0:
-        raise _EditorRefused(
-            "The insertion index must be inside the bounds of an existing paragraph."
-        )
+    pos = body.position(index)
+    if what != "footnote" and pos is not None and body.in_table(pos):
+        raise _EditorRefused("Cannot insert page break in a table.")
+    _docs_in_paragraph(body, index, _DOCS_OUTSIDE)
     return tab, body, _docs_cluster(body, index)
 
 
@@ -670,6 +684,104 @@ def _docs_insert_page_break(doc: gdocs.Document, req: dict) -> tuple[dict, bool]
     paragraph of its own."""
     _, body, pos = _docs_insert_element(doc, req, "page break")
     body.insert(pos, gdocs.PAGE_BREAK + "\n")
+    return {}, False
+
+
+def _docs_insert_table(doc: gdocs.Document, req: dict) -> tuple[dict, bool]:
+    """``insertTable``: a table of empty cells after a newline it inserts
+    (`gdocs.Body.insert_table`), in real's order of refusals, measured 2026-11-03: no location,
+    the tab, an index below zero, the segment, the index at or past the segment's end, no rows, no
+    columns, a footnote, the first section break or a table's start, row, cell or end, then inside
+    a grapheme cluster. No number of rows or columns is too many: a table of 1,000 columns and
+    one of 5,000 rows were made. `endOfSegmentLocation` is before the segment's last newline, a
+    header's or footer's included."""
+    where = req.get("location", req.get("end_of_segment_location"))
+    if where is None:
+        raise _EditorRefused("No insertion location set.")
+    tab = _docs_tab(doc, where)
+    index = where.get("index", 0)
+    if "location" in req:
+        _docs_negative(index)
+    kind, body = _docs_segment(doc, tab, where)
+    if "location" in req:
+        _docs_past_end(index, body)
+    rows, columns = req.get("rows", 0), req.get("columns", 0)
+    if rows <= 0:
+        raise _EditorRefused("The number of table rows should be greater than zero.")
+    if columns <= 0:
+        raise _EditorRefused("The number of table columns should be greater than zero.")
+    if kind == "footnote":
+        raise _EditorRefused("Cannot insert table in a footnote.")
+    if "location" in req:
+        _docs_in_paragraph(body, index, _DOCS_OUTSIDE)
+        pos = _docs_cluster(body, index)
+    else:
+        pos = len(body.chars) - 1
+    body.insert_table(pos, rows, columns)
+    return {}, False
+
+
+def _docs_cell(doc: gdocs.Document, req: dict, name: str) -> tuple[gdocs.Body, int, int, int]:
+    """The segment, the table's position and the row and column a `tableCellLocation` names, in
+    real's order of refusals, measured 2026-11-03: no cell location, no table start, the tab, an
+    index below zero, the segment, the index at or past its end, an index that is not a table's
+    start, then the row and the column, each below zero first."""
+    cell = req.get("table_cell_location")
+    if cell is None:
+        raise _EditorRefused(f"{name} requests must specify a table cell location.")
+    where = cell.get("table_start_location")
+    if where is None:
+        raise _EditorRefused("Table cell location must specify a table start location.")
+    tab = _docs_tab(doc, where)
+    index = where.get("index", 0)
+    _docs_negative(index)
+    _, body = _docs_segment(doc, tab, where)
+    _docs_past_end(index, body)
+    table = body.position(index)
+    if table is None or not body.table_at(table):
+        raise _EditorRefused(
+            "Invalid table start location. Must specify the start index of the table."
+        )
+    grid = body.grid(table)
+    for key, named, count in (
+        ("row_index", "row", len(grid)),
+        ("column_index", "column", len(grid[0]) - 1),
+    ):
+        at = cell.get(key, 0)
+        if at < 0:
+            raise _EditorRefused(f"The {named} index {at} should be non-negative.")
+        if at >= count:
+            raise _EditorRefused(
+                f"The {named} index {at} should be less than the total number of {named}s {count}."
+            )
+    return body, table, cell.get("row_index", 0), cell.get("column_index", 0)
+
+
+def _docs_insert_row(doc: gdocs.Document, req: dict) -> tuple[dict, bool]:
+    """``insertTableRow``: above the cell's row, or below it with `insertBelow`."""
+    body, table, row, _ = _docs_cell(doc, req, "Insert table row")
+    body.insert_row(table, row, req.get("insert_below", False))
+    return {}, False
+
+
+def _docs_insert_column(doc: gdocs.Document, req: dict) -> tuple[dict, bool]:
+    """``insertTableColumn``: left of the cell's column, or right of it with `insertRight`."""
+    body, table, _, column = _docs_cell(doc, req, "Insert table column")
+    body.insert_column(table, column, req.get("insert_right", False))
+    return {}, False
+
+
+def _docs_delete_row(doc: gdocs.Document, req: dict) -> tuple[dict, bool]:
+    """``deleteTableRow``: the cell's row (`gdocs.Body.delete_row`)."""
+    body, table, row, _ = _docs_cell(doc, req, "Delete table row")
+    body.delete_row(table, row)
+    return {}, False
+
+
+def _docs_delete_column(doc: gdocs.Document, req: dict) -> tuple[dict, bool]:
+    """``deleteTableColumn``: the cell's column (`gdocs.Body.delete_column`)."""
+    body, table, _, column = _docs_cell(doc, req, "Delete table column")
+    body.delete_column(table, column)
     return {}, False
 
 
@@ -1198,7 +1310,10 @@ def _docs_update_text_style(doc: gdocs.Document, req: dict) -> tuple[dict, bool]
         raise _EditorRefused("The range should not be empty.")
     if start < body.base:
         raise _EditorRefused("Cannot operate on the first section break in the document.")
-    first, last = body.cut(start), body.cut(end)
+    reach = body.reach(body.cut(start), body.cut(end))
+    if reach is None:
+        return {}, False
+    first, last = reach
     if req.get("fields") == "*" and "link" not in read and "link" not in body.chars[first][1]:
         stated.pop("link")
     body.style(first, last, stated)
@@ -1287,10 +1402,11 @@ def _docs_create_bullets(doc: gdocs.Document, req: dict) -> tuple[dict, bool]:
     Measured too: each paragraph loses the tabs it opens with, its level being how many it had,
     at most 8, less the fewest any paragraph of the request had, and a list the request makes
     indents each level that many tabs further (paragraphs of seven tabs made a list indented 252
-    PT more than its preset). The paragraphs join the list of the paragraph before them when that
-    list's glyphs are the preset's, else the list of the first of them already in one, else one
-    new list; a paragraph already in a list stays in it and gives that whole list the preset. A
-    paragraph is indented as its list's level is."""
+    PT more than its preset). The paragraphs join the list of the paragraph right before them
+    (`gdocs.Body.follows_paragraph`) when that list's glyphs are the preset's, else the list of the
+    first of them already in one, else one new list; a paragraph already in a list stays in it and
+    gives that whole list the preset. A paragraph is indented as its list's level is. Measured
+    2026-11-03, two cells listed one after the other in one preset made two lists."""
     tab, _, body, start, end = _docs_range(doc, req.get("range"), _DOCS_NO_INDEX)
     preset = req.get("bullet_preset", 0)
     if not 0 < preset < len(_DOCS_BULLET_PRESET.names):
@@ -1302,7 +1418,7 @@ def _docs_create_bullets(doc: gdocs.Document, req: dict) -> tuple[dict, bool]:
     tabs = [min(body.leading_tabs(p), _DOCS_LIST_DEPTH) for p in paragraphs]
     fewest = min(tabs)
     levels = _docs_shifted(_DOCS_PRESETS[_DOCS_BULLET_PRESET.names[preset]], fewest)
-    before = body.bullet(paragraphs.start - 1) if paragraphs.start else None
+    before = body.bullet(paragraphs.start - 1) if body.follows_paragraph(paragraphs.start) else None
     made = next((b["listId"] for p in paragraphs if (b := body.bullet(p)) is not None), None)
     if before is not None and _docs_glyphs(_docs_levels(tab, before["listId"])) == _docs_glyphs(
         levels
@@ -1424,9 +1540,11 @@ def _docs_replace_named_range(doc: gdocs.Document, req: dict) -> tuple[dict, boo
     or those its `tabsCriteria` lists (`_docs_named_tabs`), replaced by ``text``
     (`gdocs.Document.replace_range`). Measured 2026-11-02 and 2026-11-03: neither set is refused,
     then the tabs; an id none has is refused while a name none has changes nothing and keeps the
-    `revisionId`, and an empty name is taken; a range holding its segment's last newline is refused
-    naming its id; the characters `insertText` strips are stripped, and one in `gdocs.UNWRITABLE`
-    fails the batch once every request is read. A named range of several ranges has its first
+    `revisionId`, and an empty name is taken; a range holding its segment's last newline, or part
+    of a table (`gdocs.Body.cuts_table`), is refused naming its id, while one holding a whole table
+    replaces it (measured 2026-11-03 on a cell's last newline and on a table); the characters
+    `insertText` strips are stripped, and one in `gdocs.UNWRITABLE` fails the batch once every
+    request is read. A named range of several ranges has its first
     replaced and the rest deleted, as the discovery document says."""
     if "named_range_id" not in req and "named_range_name" not in req:
         raise _EditorRefused("Must specify a named range reference")
@@ -1442,7 +1560,8 @@ def _docs_replace_named_range(doc: gdocs.Document, req: dict) -> tuple[dict, boo
     for tab, named in found:
         for r in named["ranges"]:
             body = doc.open(tab, r.get("segmentId", ""))
-            if r["endIndex"] >= body.end:
+            held = body.floor(r["startIndex"]), body.floor(r["endIndex"] - 1) + 1
+            if r["endIndex"] >= body.end or body.cuts_table(*held):
                 raise _EditorRefused(
                     f"Named range with ID {named['namedRangeId']} contains content that cannot "
                     "be replaced."
@@ -1463,6 +1582,11 @@ _DOCS_APPLY = {
     "delete_header": _docs_delete_segment("header"),
     "delete_footer": _docs_delete_segment("footer"),
     "insert_page_break": _docs_insert_page_break,
+    "insert_table": _docs_insert_table,
+    "insert_table_row": _docs_insert_row,
+    "insert_table_column": _docs_insert_column,
+    "delete_table_row": _docs_delete_row,
+    "delete_table_column": _docs_delete_column,
     "add_document_tab": _docs_add_tab,
     "delete_tab": _docs_delete_tab,
     "update_document_tab_properties": _docs_update_tab,
